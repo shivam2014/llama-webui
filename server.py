@@ -494,11 +494,36 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
     def _handle_props(self):
         props = dict(DEFAULT_PROPS)
         props.update(self.props_overrides)
+        # Try to discover the active model path from backend
+        try:
+            model_path = self._discover_model_path()
+            if model_path:
+                props["model_path"] = model_path
+        except Exception:
+            pass
         # Check query params (for autoload=false usage)
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         if "autoload" in query and query["autoload"][0].lower() == "false":
             pass
         self._json_response(props)
+
+    def _discover_model_path(self) -> Optional[str]:
+        """Fetch /v1/models from backend and return the first
+        local-path model (or any available model ID)."""
+        import urllib.request
+        req = urllib.request.Request(self.backend_url + "/v1/models")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        for entry in data.get("data", []):
+            mid = entry.get("id", "")
+            if mid.startswith("/") or "\\" in mid:
+                return mid  # local path
+        # fallback: first available model
+        for entry in data.get("data", []):
+            mid = entry.get("id", "")
+            if mid:
+                return mid
+        return None
 
     def _handle_slots(self):
         self._json_response([{"id": 0, "is_processing": False}])
