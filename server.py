@@ -163,15 +163,20 @@ class SseTimingInjector:
         data = {
             "timings": {
                 "prompt_n": self.token_count,
-                "prompt_ms": max(prompt_ms, 1),
+                "prompt_ms": max(round(prompt_ms, 2), 0.01),
                 "predicted_n": self.token_count,
-                "predicted_ms": max(gen_ms, 1),
+                "predicted_ms": max(round(gen_ms, 2), 0.01),
             },
             "choices": [],
         }
         return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
-    # ------------------------------------------------------------------
+    def process_line(self, line_without_nl: bytes) -> bytes:
+        """Process a single complete line (trailing newline already stripped).
+
+        Returns transformed content (without trailing newline).
+        """
+        return self._process_line(line_without_nl)
 
     def _process_line(self, line: bytes) -> bytes:
         m = SSE_DATA_RE.match(line.decode("utf-8", errors="replace"))
@@ -227,9 +232,9 @@ class SseTimingInjector:
 
         data["timings"] = {
             "prompt_n": self.token_count + 1,
-            "prompt_ms": max(int(prompt_ms), 1),
+            "prompt_ms": max(round(prompt_ms, 2), 0.01),
             "predicted_n": max(predicted_n, 0),
-            "predicted_ms": max(int(gen_ms), 1),
+            "predicted_ms": max(round(gen_ms, 2), 0.01),
         }
 
         # --- prompt_progress (during prompt eval, not generation) ---
@@ -353,37 +358,33 @@ def _proxy_raw_bytes(response, handler) -> None:
 
 
 def _proxy_sse(response, handler, injector: SseTimingInjector) -> None:
-    """Forward SSE, applying transformations via the injector."""
-    while True:
-        chunk = response.read(65536)
-        if not chunk:
-            break
-        transformed = injector.process_chunk(chunk)
-        if transformed:
-            try:
-                handler.wfile.write(transformed)
-                handler.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                return
-    # Flush any remaining partial line
-    remaining = injector.flush()
-    if remaining:
-        transformed = injector.process_chunk(remaining)
-        if transformed:
-            try:
-                handler.wfile.write(transformed)
-                handler.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-
-    # Inject final timings chunk
+    """Forward SSE line-by-line so each token event reaches the browser
+    the instant the backend sends it (no batching)."""
     try:
-        final = injector.build_final_chunk()
-        if final:
-            handler.wfile.write(final)
+        while True:
+            line = response.readline()
+            if not line:
+                break
+            # Strip trailing newline(s) for processing
+            content = line.rstrip(b"\n\r")
+            if content:
+                transformed = injector.process_line(content)
+                handler.wfile.write(transformed + b"\n")
+            else:
+                # Blank line — important SSE event separator
+                handler.wfile.write(b"\n")
             handler.wfile.flush()
     except (BrokenPipeError, ConnectionResetError):
         pass
+
+    # Final definitive timings chunk
+    final = injector.build_final_chunk()
+    if final:
+        try:
+            handler.wfile.write(final)
+            handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 # ---------------------------------------------------------------------------
