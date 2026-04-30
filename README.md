@@ -13,13 +13,19 @@ This project extracts that UI into a standalone server that works with **any** O
 ## Quick Start
 
 ```bash
-# Point at any OpenAI-compatible LLM server
-python server.py --backend http://localhost:8080
+# 1. Clone the repo
+git clone https://github.com/shivam2014/llama-webui.git
+cd llama-webui
 
-# Open http://localhost:3000 in your browser
+# 2. Start your backend (mlx-lm, llama.cpp, etc.) on port 8080
+
+# 3. Run the UI server (no pip install needed — stdlib only)
+python3 server.py --backend http://localhost:8080
+
+# 4. Open http://localhost:3000 in your browser
 ```
 
-The UI auto-connects to the backend. If your backend supports `/v1/chat/completions` and `/v1/models`, it works.
+That's it. No dependencies to install, no build step, no Node.js.
 
 ## Usage
 
