@@ -11,20 +11,16 @@ Usage:
 """
 
 import argparse
-import io
 import json
 import logging
 import mimetypes
 import os
 import posixpath
-import shutil
-import socket
-import sys
+import re
 import time
 import urllib.parse
-from functools import partial
 from http import HTTPStatus
-from http.client import HTTPConnection, HTTPResponse
+from http.client import HTTPConnection
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -34,6 +30,9 @@ logger = logging.getLogger("llama-webui")
 
 HERE = Path(__file__).parent.resolve()
 PUBLIC_DIR = HERE / "public"
+
+# Regex for SSE data lines
+SSE_DATA_RE = re.compile(r"^data: (.*)")
 
 DEFAULT_PROPS = {
     "default_generation_settings": {
@@ -74,7 +73,7 @@ DEFAULT_PROPS = {
             "chat_format": "chatml",
             "samplers": [
                 "dry", "top_k", "top_p", "min_p", "xtc", "typ_p",
-                "temperature", "repeat_penalty", "mirostat"
+                "temperature", "repeat_penalty", "mirostat",
             ],
             "backend_sampling": True,
             "timings_per_token": False,
@@ -102,6 +101,148 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+# ---------------------------------------------------------------------------
+# SSE transformer — inject timings + fix reasoning field name
+# ---------------------------------------------------------------------------
+
+class SseTimingInjector:
+    """Parses SSE from the backend, injects timing data, fixes field names.
+
+    The llama.cpp Web UI expects:
+      - ``timings`` (top-level) with ``prompt_n``, ``prompt_ms``,
+        ``predicted_n``, ``predicted_ms``
+      - ``prompt_progress`` (top-level)
+      - ``delta.reasoning_content`` (not ``delta.reasoning``)
+
+    mlx-lm (and most OpenAI-compatible servers) don't send these.
+    This class computes approximate timing from proxy-side wall clock
+    and injects the fields.
+    """
+
+    def __init__(self):
+        self.request_start = time.monotonic()
+        self.first_token_time: Optional[float] = None
+        self.token_count = 0
+        self.had_first_content = False
+        self._buf = b""
+
+    def process_chunk(self, raw: bytes) -> bytes:
+        """Process a raw byte chunk from the upstream.
+
+        Returns the (possibly modified) bytes to send downstream.
+        Caller should call after the stream ends to get any trailing
+        data and a final timings chunk.
+        """
+        self._buf += raw
+        result = b""
+        while True:
+            idx = self._buf.find(b"\n")
+            if idx == -1:
+                break
+            line = self._buf[:idx]
+            self._buf = self._buf[idx + 1:]
+            result += self._process_line(line) + b"\n"
+        return result
+
+    def flush(self) -> bytes:
+        """Return any remaining buffered data (non-line-terminated)."""
+        rest = self._buf
+        self._buf = b""
+        return rest
+
+    def build_final_chunk(self) -> Optional[bytes]:
+        """Build a final SSE data chunk with definitive timing info.
+
+        Returns None if there's nothing useful to send.
+        """
+        if self.token_count == 0 or not self.had_first_content:
+            return None
+        now = time.monotonic()
+        gen_ms = (now - self.first_token_time) * 1000
+        prompt_ms = (self.first_token_time - self.request_start) * 1000
+        data = {
+            "timings": {
+                "prompt_n": self.token_count,
+                "prompt_ms": max(prompt_ms, 1),
+                "predicted_n": self.token_count,
+                "predicted_ms": max(gen_ms, 1),
+            },
+            "choices": [],
+        }
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    # ------------------------------------------------------------------
+
+    def _process_line(self, line: bytes) -> bytes:
+        m = SSE_DATA_RE.match(line.decode("utf-8", errors="replace"))
+        if not m:
+            return line
+
+        payload = m.group(1).strip()
+        if payload == "[DONE]":
+            return line
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return line
+
+        self._inject_timings(data)
+        self._fix_reasoning_field(data)
+        new_payload = json.dumps(data, ensure_ascii=False)
+        return f"data: {new_payload}".encode("utf-8")
+
+    def _fix_reasoning_field(self, data: dict) -> None:
+        """Rename delta.reasoning -> delta.reasoning_content."""
+        try:
+            delta = data["choices"][0].get("delta")
+            if delta is not None and "reasoning" in delta:
+                delta["reasoning_content"] = delta.pop("reasoning")
+        except (KeyError, IndexError, TypeError):
+            pass
+
+    def _inject_timings(self, data: dict) -> None:
+        """Inject timings and prompt_progress into the SSE data."""
+        now = time.monotonic()
+        elapsed_ms = (now - self.request_start) * 1000
+
+        # Detect first content-bearing token
+        try:
+            delta = data["choices"][0].get("delta", {})
+            content = delta.get("content") or delta.get("reasoning_content")
+        except (KeyError, IndexError, TypeError):
+            content = None
+
+        if content and not self.had_first_content:
+            self.first_token_time = now
+            self.had_first_content = True
+
+        if content:
+            self.token_count += 1
+
+        # --- timing computation ---
+        prompt_ms = ((self.first_token_time or now) - self.request_start) * 1000
+        gen_ms = (now - (self.first_token_time or now)) * 1000
+        predicted_n = max(0, self.token_count - (1 if self.had_first_content else 0))
+
+        data["timings"] = {
+            "prompt_n": self.token_count + 1,
+            "prompt_ms": max(int(prompt_ms), 1),
+            "predicted_n": max(predicted_n, 0),
+            "predicted_ms": max(int(gen_ms), 1),
+        }
+
+        # --- prompt_progress (during prompt eval, not generation) ---
+        if not self.had_first_content:
+            data["prompt_progress"] = {
+                "percent": min(99, int(elapsed_ms / 200)),
+            }
+
+
+# ---------------------------------------------------------------------------
+# Proxy helpers
+# ---------------------------------------------------------------------------
+
 def _build_upstream_request(handler: BaseHTTPRequestHandler, backend_url: str) -> tuple:
     """Build an upstream request from the incoming handler's request.
 
@@ -118,7 +259,6 @@ def _build_upstream_request(handler: BaseHTTPRequestHandler, backend_url: str) -
         except Exception:
             body = None
 
-    # Forward relevant headers, skip hop-by-hop
     skip_headers = {
         "Host", "Connection", "Keep-Alive", "Proxy-Authenticate",
         "Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding",
@@ -132,8 +272,26 @@ def _build_upstream_request(handler: BaseHTTPRequestHandler, backend_url: str) -
     return handler.command, path, headers, body
 
 
+def _send_upstream_request(conn: HTTPConnection, method: str, path: str,
+                            headers: dict, body: Optional[bytes], backend_url: str) -> None:
+    """Send the HTTP request to the upstream."""
+    parsed = urllib.parse.urlparse(backend_url)
+    is_secure = parsed.scheme == "https"
+    default_port = 443 if is_secure else 80
+    port = parsed.port or default_port
+    host = parsed.hostname or "localhost"
+
+    conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+    conn.putheader("Host", f"{host}:{port}" if port != default_port else host)
+    for key, value in headers.items():
+        conn.putheader(key, value)
+    if body is not None:
+        conn.putheader("Content-Length", str(len(body)))
+    conn.endheaders(body)
+
+
 def proxy_stream(handler: BaseHTTPRequestHandler, backend_url: str) -> None:
-    """Proxy a request to the backend, streaming the response back."""
+    """Proxy a request to the backend, optionally transforming SSE streaming."""
     backend_parsed = urllib.parse.urlparse(backend_url)
     is_secure = backend_parsed.scheme == "https"
     port = backend_parsed.port or (443 if is_secure else 80)
@@ -144,42 +302,35 @@ def proxy_stream(handler: BaseHTTPRequestHandler, backend_url: str) -> None:
     try:
         conn = HTTPConnection(host, port, timeout=60)
         conn.connect()
-
-        # Send the request
-        conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
-        conn.putheader("Host", f"{host}:{port}" if port != (443 if is_secure else 80) else host)
-        for key, value in headers.items():
-            conn.putheader(key, value)
-        if body is not None:
-            conn.putheader("Content-Length", str(len(body)))
-        conn.endheaders(body)
-
+        _send_upstream_request(conn, method, path, headers, body, backend_url)
         response = conn.getresponse()
 
-        # Read response headers and send to client
+        content_type = response.getheader("Content-Type", "")
+        is_sse = "text/event-stream" in content_type
+
+        # Forward response headers
         handler.send_response(response.status)
-        skip_response_headers = {
-            "Transfer-Encoding", "Connection", "Keep-Alive",
-        }
+        skip_response_headers = {"Transfer-Encoding", "Connection", "Keep-Alive"}
         for key, value in response.getheaders():
             if key not in skip_response_headers:
                 handler.send_header(key, value)
         handler.end_headers()
 
-        # Stream the response body
-        while True:
-            chunk = response.read(65536)
-            if not chunk:
-                break
-            try:
-                handler.wfile.write(chunk)
-                handler.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                break
+        if is_sse:
+            injector = SseTimingInjector()
+            _proxy_sse(response, handler, injector)
+        else:
+            _proxy_raw_bytes(response, handler)
 
         response.close()
         conn.close()
 
+    except ConnectionRefusedError:
+        logger.error("Connection refused: %s", backend_url)
+        try:
+            handler.send_error(502, "Connection refused — backend may be offline")
+        except Exception:
+            pass
     except Exception as e:
         logger.error("Proxy error for %s %s: %s", method, path, e)
         try:
@@ -188,26 +339,71 @@ def proxy_stream(handler: BaseHTTPRequestHandler, backend_url: str) -> None:
             pass
 
 
+def _proxy_raw_bytes(response, handler) -> None:
+    """Blindly forward raw bytes (non-streaming responses)."""
+    while True:
+        chunk = response.read(65536)
+        if not chunk:
+            break
+        try:
+            handler.wfile.write(chunk)
+            handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            break
+
+
+def _proxy_sse(response, handler, injector: SseTimingInjector) -> None:
+    """Forward SSE, applying transformations via the injector."""
+    while True:
+        chunk = response.read(65536)
+        if not chunk:
+            break
+        transformed = injector.process_chunk(chunk)
+        if transformed:
+            try:
+                handler.wfile.write(transformed)
+                handler.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+    # Flush any remaining partial line
+    remaining = injector.flush()
+    if remaining:
+        transformed = injector.process_chunk(remaining)
+        if transformed:
+            try:
+                handler.wfile.write(transformed)
+                handler.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    # Inject final timings chunk
+    try:
+        final = injector.build_final_chunk()
+        if final:
+            handler.wfile.write(final)
+            handler.wfile.flush()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Static file helpers
+# ---------------------------------------------------------------------------
+
 def read_static_file(path: str) -> tuple[Optional[bytes], Optional[str]]:
     """Read a static file from the public directory.
 
     Returns (content, mime_type) or (None, None) if not found.
     """
-    # Normalize path, prevent directory traversal
     rel_path = posixpath.normpath(path.lstrip("/"))
     abs_path = (PUBLIC_DIR / rel_path).resolve()
-
-    # Must be within PUBLIC_DIR
     if not str(abs_path).startswith(str(PUBLIC_DIR.resolve())):
         return None, None
-
     if not abs_path.is_file():
         return None, None
-
     mime_type, _ = mimetypes.guess_type(str(abs_path))
     if mime_type is None:
         mime_type = "application/octet-stream"
-
     return abs_path.read_bytes(), mime_type
 
 
@@ -216,7 +412,6 @@ def handle_static_or_404(handler: BaseHTTPRequestHandler, path: str) -> bool:
     content, mime_type = read_static_file(path)
     if content is None:
         return False
-
     handler.send_response(HTTPStatus.OK)
     handler.send_header("Content-Type", mime_type)
     handler.send_header("Content-Length", str(len(content)))
@@ -226,19 +421,21 @@ def handle_static_or_404(handler: BaseHTTPRequestHandler, path: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# HTTP handler
+# ---------------------------------------------------------------------------
+
 class LlamaWebUIHandler(BaseHTTPRequestHandler):
     """HTTP request handler for llama-webui."""
 
-    # Set by factory
     backend_url = "http://localhost:8080"
     props_overrides = {}
     start_time = time.time()
 
-    # Silence default logging (we use our own)
     def log_message(self, format, *args):
         logger.info("%s - %s", self.client_address[0], format % args)
 
-    # ---- CORS ----
+    # -- CORS --
 
     def _cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -246,7 +443,7 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "*")
         self.send_header("Access-Control-Max-Age", "86400")
 
-    # ---- Routes ----
+    # -- Routes --
 
     def do_OPTIONS(self):
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -255,7 +452,6 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
-
         if path == "/health":
             self._json_response({"status": "ok", "uptime": time.time() - self.start_time})
         elif path == "/props":
@@ -264,7 +460,7 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
             self._handle_slots()
         elif path.startswith("/v1/"):
             proxy_stream(self, self.backend_url)
-        elif path == "/" or path == "":
+        elif path in ("/", ""):
             if not handle_static_or_404(self, "/index.html"):
                 self.send_error(404, "Not Found")
         else:
@@ -273,7 +469,6 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-
         if path.startswith("/v1/"):
             proxy_stream(self, self.backend_url)
         else:
@@ -293,28 +488,21 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404, "Not Found")
 
-    # ---- Endpoint handlers ----
+    # -- Endpoint handlers --
 
     def _handle_props(self):
         props = dict(DEFAULT_PROPS)
         props.update(self.props_overrides)
-
-        # Check query params
+        # Check query params (for autoload=false usage)
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         if "autoload" in query and query["autoload"][0].lower() == "false":
-            pass  # props is same regardless, we just don't auto-load
-
+            pass
         self._json_response(props)
 
     def _handle_slots(self):
-        self._json_response([
-            {
-                "id": 0,
-                "is_processing": False,
-            }
-        ])
+        self._json_response([{"id": 0, "is_processing": False}])
 
-    # ---- Helpers ----
+    # -- Helpers --
 
     def _json_response(self, data, status=HTTPStatus.OK):
         body = json.dumps(data).encode("utf-8")
@@ -328,7 +516,7 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
 
 def create_handler(backend_url: str, **props_overrides):
     """Factory to create a handler class with configured backend_url."""
-    cls = type(
+    return type(
         "ConfiguredHandler",
         (LlamaWebUIHandler,),
         {
@@ -336,8 +524,11 @@ def create_handler(backend_url: str, **props_overrides):
             "props_overrides": props_overrides,
         },
     )
-    return cls
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -352,7 +543,7 @@ def main():
         "--port",
         type=int,
         default=int(os.environ.get("LLAMA_WEBUI_PORT", "3000")),
-        help="Port to listen on (default: 3000, env: LLAMA_WEBUI_PORT)",
+        help="Listen port (default: 3000, env: LLAMA_WEBUI_PORT)",
     )
     parser.add_argument(
         "--backend",
@@ -393,15 +584,13 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    # Build props overrides from CLI args
-    props_overrides = {}
-    modalities = {"vision": args.vision, "audio": args.audio}
-    default_params = dict(DEFAULT_PROPS["default_generation_settings"]["params"])
-    props_overrides["modalities"] = modalities
-    props_overrides["default_generation_settings"] = dict(
-        DEFAULT_PROPS["default_generation_settings"]
-    )
-    props_overrides["default_generation_settings"]["n_ctx"] = args.ctx_size
+    props_overrides = {
+        "modalities": {"vision": args.vision, "audio": args.audio},
+        "default_generation_settings": {
+            **DEFAULT_PROPS["default_generation_settings"],
+            "n_ctx": args.ctx_size,
+        },
+    }
 
     handler_class = create_handler(
         backend_url=args.backend.rstrip("/"),
@@ -414,6 +603,7 @@ def main():
     logger.info("Proxying /v1/* to backend: %s", args.backend)
     logger.info("Modalities: vision=%s, audio=%s", args.vision, args.audio)
     logger.info("Context size: %d", args.ctx_size)
+    logger.info("SSE timing injection: enabled")
     logger.info("Open http://%s:%d in your browser", args.host, args.port)
 
     try:
