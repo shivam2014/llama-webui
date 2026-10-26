@@ -74,9 +74,9 @@ Browser ──> llama-webui (port 3000) ──proxy /v1/*──> Backend (port 8
 - **Model discovery** — `/props` discovers the active model from the backend's `/v1/models`.
 - **Stubs** — `/slots` returns a minimal response for interface compatibility.
 
-![The real llama.cpp Web UI served by this project, on first load](assets/readme/ui-empty.png)
+![A real conversation in the llama.cpp Web UI served by this project](assets/readme/chat.png)
 
-*Served from `public/` by `server.py` — this is the interface as it loads, with no llama.cpp process involved.*
+*A real conversation through the proxy — `mtplx-bonsai-2 27B` answering with syntax highlighting, a collapsible reasoning block, and live throughput (144 tokens at 23.4 tok/s). No llama.cpp process behind it.*
 
 ## Features
 
