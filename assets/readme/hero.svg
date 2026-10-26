@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="360" viewBox="0 0 1200 360"
+     role="img" aria-labelledby="heroTitle heroDesc">
+  <title id="heroTitle">llama-webui — llama.cpp's Web UI as a standalone server for any OpenAI-compatible backend</title>
+  <desc id="heroDesc">A single stdlib Python server serves the prebuilt Svelte chat UI on port 3000 and proxies /v1 requests to a backend on port 8080. The backend can be mlx-lm, llama.cpp, vLLM or Ollama. No Node.js, no pip install.</desc>
+
+  <defs>
+    <marker id="tip" viewBox="0 0 8 8" refX="7" refY="4"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L8,4 L0,8 z" fill="#6B6B6B"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="360" rx="20" fill="#161616"/>
+
+  <g id="title-block" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="56" y="88" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" letter-spacing="2" fill="#9A9A9A">STANDALONE SERVER &#183; NO NODE &#183; NO PIP</text>
+
+    <text x="56" y="154" font-size="56" font-weight="650" fill="#F5F5F5">llama-webui</text>
+
+    <text x="56" y="198" font-size="21" fill="#F5F5F5">llama.cpp's chat UI, without llama.cpp.</text>
+    <text x="56" y="226" font-size="21" fill="#9A9A9A">One stdlib proxy in front of any OpenAI backend.</text>
+
+    <rect x="56" y="272" width="520" height="48" rx="8" fill="#1E1E1E" stroke="#2E2E2E" stroke-width="1.5"/>
+    <text x="74" y="302" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" fill="#D4D4D4">python3 server.py</text>
+    <text x="272" y="302" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" fill="#6B6B6B">--backend &lt;url&gt;</text>
+  </g>
+
+  <g id="request-path">
+    <rect x="616" y="56" width="528" height="288" rx="12" fill="#1B1B1B" stroke="#2E2E2E" stroke-width="1.5"/>
+
+    <g stroke="#6B6B6B" stroke-width="1.5">
+      <line x1="640" y1="162" x2="640" y2="180" marker-end="url(#tip)"/>
+      <line x1="640" y1="242" x2="640" y2="260" marker-end="url(#tip)"/>
+    </g>
+
+    <rect x="664" y="104" width="456" height="58" rx="10" fill="#232323" stroke="#313131" stroke-width="1.5"/>
+    <text x="686" y="128" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+          font-size="20" font-weight="600" fill="#F5F5F5">Your browser</text>
+    <text x="686" y="150" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" fill="#9A9A9A">localhost:3000</text>
+
+    <rect x="664" y="184" width="456" height="58" rx="10" fill="#232323" stroke="#2DD4BF" stroke-opacity="0.6" stroke-width="1.5"/>
+    <text x="686" y="208" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+          font-size="20" font-weight="600" fill="#F5F5F5">llama-webui</text>
+    <text x="686" y="230" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" fill="#9A9A9A">serves public/ &#183; proxies /v1/*</text>
+
+    <rect x="664" y="264" width="456" height="58" rx="10" fill="#232323" stroke="#313131" stroke-width="1.5"/>
+    <text x="686" y="288" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+          font-size="20" font-weight="600" fill="#F5F5F5">Any OpenAI backend</text>
+    <text x="686" y="310" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" fill="#9A9A9A">mlx-lm &#183; llama.cpp &#183; vLLM &#183; Ollama</text>
+  </g>
+</svg>
