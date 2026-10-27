@@ -248,7 +248,26 @@ class SseTimingInjector:
 # Proxy helpers
 # ---------------------------------------------------------------------------
 
-def _build_upstream_request(handler: BaseHTTPRequestHandler, backend_url: str) -> tuple:
+def _auth_header_name(api_key_header: str) -> str:
+    """Header name used to send the backend API key."""
+    return api_key_header or "Authorization"
+
+
+def _auth_header_value(api_key: str, header_name: str) -> str:
+    """Value for the backend API key header.
+
+    ``Authorization`` gets the ``Bearer `` scheme every OpenAI-compatible
+    provider expects; any other header (``x-api-key``, ``api-key``, ...)
+    receives the key verbatim.
+    """
+    if header_name.lower() == "authorization":
+        return f"Bearer {api_key}"
+    return api_key
+
+
+def _build_upstream_request(handler: BaseHTTPRequestHandler, backend_url: str,
+                            backend_api_key: str = "",
+                            backend_api_key_header: str = "Authorization") -> tuple:
     """Build an upstream request from the incoming handler's request.
 
     Returns (method, path, headers, body).
@@ -269,10 +288,21 @@ def _build_upstream_request(handler: BaseHTTPRequestHandler, backend_url: str) -
         "Proxy-Authorization", "TE", "Trailer", "Transfer-Encoding",
         "Upgrade", "Content-Length",
     }
+    auth_header = _auth_header_name(backend_api_key_header)
+    auth_header_lower = auth_header.lower()
+
     headers = {}
     for key, value in handler.headers.items():
-        if key not in skip_headers:
-            headers[key] = value
+        if key in skip_headers:
+            continue
+        # A server-side key replaces whatever the browser sent, so a user's
+        # own Authorization header never leaks to the provider.
+        if backend_api_key and key.lower() == auth_header_lower:
+            continue
+        headers[key] = value
+
+    if backend_api_key:
+        headers[auth_header] = _auth_header_value(backend_api_key, auth_header)
 
     return handler.command, path, headers, body
 
@@ -295,14 +325,18 @@ def _send_upstream_request(conn: HTTPConnection, method: str, path: str,
     conn.endheaders(body)
 
 
-def proxy_stream(handler: BaseHTTPRequestHandler, backend_url: str) -> None:
+def proxy_stream(handler: BaseHTTPRequestHandler, backend_url: str,
+                 backend_api_key: str = "",
+                 backend_api_key_header: str = "Authorization") -> None:
     """Proxy a request to the backend, optionally transforming SSE streaming."""
     backend_parsed = urllib.parse.urlparse(backend_url)
     is_secure = backend_parsed.scheme == "https"
     port = backend_parsed.port or (443 if is_secure else 80)
     host = backend_parsed.hostname or "localhost"
 
-    method, path, headers, body = _build_upstream_request(handler, backend_url)
+    method, path, headers, body = _build_upstream_request(
+        handler, backend_url, backend_api_key, backend_api_key_header
+    )
 
     try:
         conn = HTTPConnection(host, port, timeout=60)
@@ -430,6 +464,8 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
     """HTTP request handler for llama-webui."""
 
     backend_url = "http://localhost:8080"
+    backend_api_key = ""
+    backend_api_key_header = "Authorization"
     props_overrides = {}
     start_time = time.time()
 
@@ -460,7 +496,8 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
         elif path == "/slots":
             self._handle_slots()
         elif path.startswith("/v1/"):
-            proxy_stream(self, self.backend_url)
+            proxy_stream(self, self.backend_url,
+                         self.backend_api_key, self.backend_api_key_header)
         elif path in ("/", ""):
             if not handle_static_or_404(self, "/index.html"):
                 self.send_error(404, "Not Found")
@@ -471,21 +508,24 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/v1/"):
-            proxy_stream(self, self.backend_url)
+            proxy_stream(self, self.backend_url,
+                         self.backend_api_key, self.backend_api_key_header)
         else:
             self.send_error(404, "Not Found")
 
     def do_PUT(self):
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/v1/"):
-            proxy_stream(self, self.backend_url)
+            proxy_stream(self, self.backend_url,
+                         self.backend_api_key, self.backend_api_key_header)
         else:
             self.send_error(404, "Not Found")
 
     def do_DELETE(self):
         path = urllib.parse.urlparse(self.path).path
         if path.startswith("/v1/"):
-            proxy_stream(self, self.backend_url)
+            proxy_stream(self, self.backend_url,
+                         self.backend_api_key, self.backend_api_key_header)
         else:
             self.send_error(404, "Not Found")
 
@@ -512,6 +552,9 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
         local-path model (or any available model ID)."""
         import urllib.request
         req = urllib.request.Request(self.backend_url + "/v1/models")
+        if self.backend_api_key:
+            name = _auth_header_name(self.backend_api_key_header)
+            req.add_header(name, _auth_header_value(self.backend_api_key, name))
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
         for entry in data.get("data", []):
@@ -540,13 +583,17 @@ class LlamaWebUIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def create_handler(backend_url: str, **props_overrides):
+def create_handler(backend_url: str, backend_api_key: str = "",
+                   backend_api_key_header: str = "Authorization",
+                   **props_overrides):
     """Factory to create a handler class with configured backend_url."""
     return type(
         "ConfiguredHandler",
         (LlamaWebUIHandler,),
         {
             "backend_url": backend_url,
+            "backend_api_key": backend_api_key,
+            "backend_api_key_header": backend_api_key_header,
             "props_overrides": props_overrides,
         },
     )
@@ -589,6 +636,19 @@ def main():
         help="Enable audio modality support",
     )
     parser.add_argument(
+        "--backend-api-key",
+        default=os.environ.get("LLAMA_WEBUI_BACKEND_API_KEY", ""),
+        help="API key for the backend, kept server-side "
+             "(env: LLAMA_WEBUI_BACKEND_API_KEY)",
+    )
+    parser.add_argument(
+        "--backend-api-key-header",
+        default=os.environ.get("LLAMA_WEBUI_BACKEND_API_KEY_HEADER", "Authorization"),
+        help="Header used to send --backend-api-key. Authorization gets "
+             "'Bearer <key>'; any other header gets the key verbatim "
+             "(default: Authorization, env: LLAMA_WEBUI_BACKEND_API_KEY_HEADER)",
+    )
+    parser.add_argument(
         "--ctx-size",
         type=int,
         default=int(os.environ.get("LLAMA_WEBUI_CTX_SIZE", "8192")),
@@ -620,6 +680,8 @@ def main():
 
     handler_class = create_handler(
         backend_url=args.backend.rstrip("/"),
+        backend_api_key=args.backend_api_key.strip(),
+        backend_api_key_header=args.backend_api_key_header.strip(),
         **props_overrides,
     )
 
@@ -628,6 +690,11 @@ def main():
     logger.info("llama-webui starting on http://%s:%d", args.host, args.port)
     logger.info("Proxying /v1/* to backend: %s", args.backend)
     logger.info("Modalities: vision=%s, audio=%s", args.vision, args.audio)
+    if args.backend_api_key.strip():
+        logger.info("Backend API key: configured (sent as %s)",
+                    _auth_header_name(args.backend_api_key_header.strip()))
+    else:
+        logger.info("Backend API key: none (forwarding client credentials)")
     logger.info("Context size: %d", args.ctx_size)
     logger.info("SSE timing injection: enabled")
     logger.info("Open http://%s:%d in your browser", args.host, args.port)
