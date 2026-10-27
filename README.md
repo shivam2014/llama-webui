@@ -3,30 +3,54 @@
        alt="llama-webui — llama.cpp's chat UI served standalone by one stdlib Python proxy, in front of any OpenAI-compatible backend.">
 </p>
 
-**llama.cpp's Web UI, without llama.cpp.** A 643-line Python server serves the prebuilt [Svelte 5 chat interface](https://github.com/ggml-org/llama.cpp/tree/master/tools/server/webui) and proxies `/v1/*` to any OpenAI-compatible backend — mlx-lm, llama.cpp, vLLM, Ollama, or your own.
+**llama.cpp's Web UI, without llama.cpp.** One 643-line stdlib Python server serves the prebuilt [Svelte 5 chat interface](https://github.com/ggml-org/llama.cpp/tree/master/tools/server/webui) and proxies `/v1/*` to any OpenAI-compatible backend — mlx-lm, llama.cpp, vLLM, Ollama, or your own.
 
-No build step. No Node.js. No pip install. Python 3.10+ standard library only.
+![A real conversation in the Web UI served by this project](assets/readme/chat-dark.png)
 
-## Why this exists
+*`server.py` in front of a local OpenAI-compatible backend: KaTeX, highlighted code, a collapsible reasoning panel and live tokens/sec. No llama.cpp process behind it.*
 
-MLX has excellent model support on Apple Silicon, but it was missing a polished chat UI. llama.cpp's Web UI is clean and feature-rich — streaming, reasoning display, conversation branching, markdown and KaTeX rendering, file attachments — but it ships tightly coupled to llama.cpp's C++ server.
-
-This project separates the two. Point it at mlx-lm and you get the same experience you would get from llama.cpp's own server.
-
-## Quick start
+## Run it
 
 ```bash
-# 1. Clone
 git clone https://github.com/shivam2014/llama-webui.git
 cd llama-webui
 
-# 2. Start your backend (mlx-lm, llama.cpp, etc.) on port 8080
-
-# 3. Run the UI server — no pip install needed
-python3 server.py --backend http://localhost:8080
-
-# 4. Open http://localhost:3000
+python3 server.py --backend http://localhost:8080   # your backend
+# open http://localhost:3000
 ```
+
+No build step, no Node.js, no `pip install`. Python 3.10+ standard library only.
+
+## What you get
+
+The real llama.cpp interface, with that project's C++ server replaced by a proxy:
+
+- Streaming chat with live tokens/sec, token counts and context usage
+- Reasoning and thinking panels from Qwen, DeepSeek and other reasoning models
+- Markdown, syntax highlighting and KaTeX math
+- Conversation branching, editing, regeneration, deletion
+- Import and export of conversations as JSON
+- File attachments: images, PDF, audio, plain text
+- Dark and light themes, following the system preference
+- A model selector populated from the backend's `/v1/models`
+- Keyboard shortcuts
+
+![The same conversation in light theme](assets/readme/chat-light.png)
+
+*Same conversation, light theme. The theme follows the system preference until you pin one in settings.*
+
+## Why this exists
+
+MLX is excellent on Apple Silicon but had no polished chat UI. llama.cpp's Web UI is clean and feature-rich, yet it ships tightly coupled to llama.cpp's own server. This separates the two, so an mlx-lm, vLLM or Ollama backend gets the same interface llama.cpp users get.
+
+## How it works
+
+- **Static files** — the prebuilt Svelte 5 UI (`index.html`, `bundle.js`, `bundle.css`) is served from `public/`.
+- **API proxy** — every `/v1/*` request is forwarded to `--backend`.
+- **SSE injection** — the proxy adds `timings` (tokens/sec stats) and renames `delta.reasoning` to `delta.reasoning_content`, so backends using OpenAI's field naming work unchanged.
+- **Line-by-line streaming** — each SSE event is forwarded as it arrives, with no batching.
+- **Model discovery** — `/props` reports the model discovered from the backend's `/v1/models`.
+- **Stubs** — `/slots` returns a minimal response for interface compatibility.
 
 ## Usage
 
@@ -39,6 +63,8 @@ python server.py [OPTIONS]
 | `--host` | `127.0.0.1` | `LLAMA_WEBUI_HOST` | Bind address |
 | `--port` | `3000` | `LLAMA_WEBUI_PORT` | Listen port |
 | `--backend` | `http://localhost:8080` | `LLAMA_WEBUI_BACKEND` | Backend API URL |
+| `--backend-api-key` | none | `LLAMA_WEBUI_BACKEND_API_KEY` | API key for the backend, kept server-side |
+| `--backend-api-key-header` | `Authorization` | `LLAMA_WEBUI_BACKEND_API_KEY_HEADER` | Header carrying that key; `Authorization` is sent as `Bearer <key>` |
 | `--vision` | off | `LLAMA_WEBUI_VISION=1` | Enable vision (image upload) |
 | `--audio` | off | `LLAMA_WEBUI_AUDIO=1` | Enable audio (voice input) |
 | `--ctx-size` | `8192` | `LLAMA_WEBUI_CTX_SIZE` | Default context window |
@@ -48,66 +74,29 @@ python server.py [OPTIONS]
 # With mlx-lm
 python server.py --backend http://localhost:8080
 
-# With vLLM
+# With vLLM on another port
 python server.py --backend http://localhost:8000 --port 4000
 
 # With vision support (LLaVA and friends)
 python server.py --backend http://localhost:8080 --vision
 
+# With a hosted OpenAI-compatible provider (the key stays on the server)
+python server.py --backend https://openrouter.ai/api/v1 --backend-api-key sk-or-v1-...
+
+# With a backend that wants a non-Bearer header
+python server.py --backend http://localhost:8080 \
+    --backend-api-key-header api-key --backend-api-key secret
+
 # Public-facing (put an auth proxy in front)
 python server.py --host 0.0.0.0 --port 3000
 ```
 
-## How it works
+## Notes
 
-```
-Browser ──> llama-webui (port 3000) ──proxy /v1/*──> Backend (port 8080)
-              │
-              ├── serves static UI files from public/
-              └── stubs /props and /slots endpoints
-```
-
-- **Static files** — the prebuilt Svelte 5 UI (`index.html`, `bundle.js`, `bundle.css`).
-- **API proxy** — every `/v1/*` request is forwarded to the backend.
-- **SSE injection** — the proxy injects `timings` (tokens/sec stats) and renames `delta.reasoning` to `delta.reasoning_content`, so backends using OpenAI's field naming work unchanged.
-- **Line-by-line streaming** — each SSE event is forwarded immediately, with no batching.
-- **Model discovery** — `/props` discovers the active model from the backend's `/v1/models`.
-- **Stubs** — `/slots` returns a minimal response for interface compatibility.
-
-![A real conversation in the llama.cpp Web UI served by this project](assets/readme/chat.png)
-
-*A real conversation through the proxy — `mtplx-bonsai-2 27B` answering with syntax highlighting, a collapsible reasoning block, and live throughput (144 tokens at 23.4 tok/s). No llama.cpp process behind it.*
-
-## Features
-
-- Streaming chat with real-time tokens/sec stats
-- Reasoning and thinking content display (Qwen, DeepSeek, and others)
-- Conversation branching, editing, regeneration, deletion
-- Import and export conversations as JSON
-- Markdown with syntax highlighting (highlight.js)
-- KaTeX math rendering
-- Dark and light themes, following the system preference
-- File attachments: images, PDF, audio, text
-- Model selector populated from the backend's `/v1/models`
-- Keyboard shortcuts
-
-## Requirements
-
-- Python 3.10+
-- An OpenAI-compatible LLM server (mlx-lm, llama.cpp, vLLM, Ollama, ...)
-
-## Files
-
-```
-llama-webui/
-├── server.py         # Python HTTP server + reverse proxy (643 lines)
-├── public/
-│   ├── index.html    # UI entry point
-│   ├── bundle.js     # Svelte 5 app bundle (6.2MB)
-│   ├── bundle.css    # TailwindCSS styles (489KB)
-│   └── loading.html  # Loading placeholder
-└── README.md
-```
+- Client headers, including `Origin`, are forwarded to the backend. If a backend refuses cross-origin requests, chat requests fail with `403`.
+- `--backend-api-key` replaces any `Authorization` header the browser sends, and is never logged or exposed by `/props`. Without the flag, the key typed into the UI's API Key setting is forwarded instead.
+- The UI is served as static files, so edits to `public/` appear on reload.
+- Need several providers at once? Run a gateway such as [LiteLLM](https://docs.litellm.ai/docs/simple_proxy) and point `--backend` at it — this server only needs one OpenAI-compatible URL.
 
 ## Updating the UI bundle
 
