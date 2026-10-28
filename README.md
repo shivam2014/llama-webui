@@ -3,7 +3,7 @@
        alt="llama-webui — llama.cpp's chat UI served standalone by one stdlib Python proxy, in front of any OpenAI-compatible backend.">
 </p>
 
-**llama.cpp's Web UI, without llama.cpp.** One 643-line stdlib Python server serves the prebuilt [Svelte 5 chat interface](https://github.com/ggml-org/llama.cpp/tree/master/tools/server/webui) and proxies `/v1/*` to any OpenAI-compatible backend — mlx-lm, llama.cpp, vLLM, Ollama, or your own.
+**llama.cpp's Web UI, without llama.cpp.** One 643-line stdlib Python server serves the prebuilt [Svelte 5 chat interface](https://github.com/ggml-org/llama.cpp/tree/master/tools/server/webui) and proxies `/v1/*` to any OpenAI-compatible backend — mlx-lm, llama.cpp, vLLM, Ollama, OpenRouter, or your own.
 
 ![A real conversation in the Web UI served by this project](assets/readme/chat-dark.png)
 
@@ -15,8 +15,13 @@
 git clone https://github.com/shivam2014/llama-webui.git
 cd llama-webui
 
-python3 server.py --backend http://localhost:8080   # your backend
-# open http://localhost:3000
+# a local backend
+python3 server.py --backend http://localhost:8080
+
+# or a hosted provider — the key stays on the server
+python3 server.py --backend https://openrouter.ai/api/v1 --backend-api-key sk-or-v1-...
+
+# then open http://localhost:3000
 ```
 
 No build step, no Node.js, no `pip install`. Python 3.10+ standard library only.
@@ -79,9 +84,6 @@ python server.py --backend http://localhost:8000 --port 4000
 
 # With vision support (LLaVA and friends)
 python server.py --backend http://localhost:8080 --vision
-
-# With a hosted OpenAI-compatible provider (the key stays on the server)
-python server.py --backend https://openrouter.ai/api/v1 --backend-api-key sk-or-v1-...
 
 # With a backend that wants a non-Bearer header
 python server.py --backend http://localhost:8080 \
